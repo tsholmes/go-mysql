@@ -1,12 +1,14 @@
 package replication
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
 	"math"
 
 	. "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pingcap/errors"
+	"github.com/segmentio/objconv"
+	ojson "github.com/segmentio/objconv/json"
 	"github.com/siddontang/go/hack"
 )
 
@@ -76,74 +78,95 @@ func (e *RowsEvent) decodeJsonBinary(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return []byte{}, nil
 	}
+	buffer := bytes.NewBuffer(nil)
+	emitter := ojson.NewEmitter(buffer)
 	d := jsonBinaryDecoder{
 		useDecimal:      e.useDecimal,
 		ignoreDecodeErr: e.ignoreJSONDecodeErr,
+
+		emitter: emitter,
 	}
 
 	if d.isDataShort(data, 1) {
 		return nil, d.err
 	}
 
-	v := d.decodeValue(data[0], data[1:])
+	d.emitValue(data[0], data[1:])
 	if d.err != nil {
 		return nil, d.err
 	}
 
-	return json.Marshal(v)
+	return buffer.Bytes(), nil
 }
 
 type jsonBinaryDecoder struct {
 	useDecimal      bool
 	ignoreDecodeErr bool
 	err             error
+
+	emitter objconv.Emitter
 }
 
-func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) interface{} {
+func (d *jsonBinaryDecoder) emitValue(tp byte, data []byte) {
 	if d.err != nil {
-		return nil
+		return
 	}
 
 	switch tp {
 	case JSONB_SMALL_OBJECT:
-		return d.decodeObjectOrArray(data, true, true)
+		d.emitObjectOrArray(data, true, true)
+		return
 	case JSONB_LARGE_OBJECT:
-		return d.decodeObjectOrArray(data, false, true)
+		d.emitObjectOrArray(data, false, true)
+		return
 	case JSONB_SMALL_ARRAY:
-		return d.decodeObjectOrArray(data, true, false)
+		d.emitObjectOrArray(data, true, false)
+		return
 	case JSONB_LARGE_ARRAY:
-		return d.decodeObjectOrArray(data, false, false)
+		d.emitObjectOrArray(data, false, false)
+		return
 	case JSONB_LITERAL:
-		return d.decodeLiteral(data)
+		d.emitLiteral(data)
+		return
 	case JSONB_INT16:
-		return d.decodeInt16(data)
+		d.emitInt16(data)
+		return
 	case JSONB_UINT16:
-		return d.decodeUint16(data)
+		d.emitUint16(data)
+		return
 	case JSONB_INT32:
-		return d.decodeInt32(data)
+		d.emitInt32(data)
+		return
 	case JSONB_UINT32:
-		return d.decodeUint32(data)
+		d.emitUint32(data)
+		return
 	case JSONB_INT64:
-		return d.decodeInt64(data)
+		d.emitInt64(data)
+		return
 	case JSONB_UINT64:
-		return d.decodeUint64(data)
+		d.emitUint64(data)
+		return
 	case JSONB_DOUBLE:
-		return d.decodeDouble(data)
+		d.emitDouble(data)
+		return
 	case JSONB_STRING:
-		return d.decodeString(data)
+		d.emitString(data)
+		return
 	case JSONB_OPAQUE:
-		return d.decodeOpaque(data)
+		// d.emitOpaque(data)
+		return
 	default:
 		d.err = errors.Errorf("invalid json type %d", tp)
 	}
 
-	return nil
+	return
 }
 
-func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObject bool) interface{} {
+func (d *jsonBinaryDecoder) emitObjectOrArray(data []byte, isSmall bool, isObject bool) {
 	offsetSize := jsonbGetOffsetSize(isSmall)
 	if d.isDataShort(data, 2*offsetSize) {
-		return nil
+		d.emitter.EmitNil()
+		return
 	}
 
 	count := d.decodeCount(data, isSmall)
@@ -157,7 +180,8 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 		if d.ignoreDecodeErr {
 			d.err = nil
 		}
-		return nil
+		d.emitter.EmitNil()
+		return
 	}
 
 	keyEntrySize := jsonbGetKeyEntrySize(isSmall)
@@ -171,7 +195,7 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 
 	if headerSize > size {
 		d.err = errors.Errorf("header size %d > size %d", headerSize, size)
-		return nil
+		return
 	}
 
 	var keys []string
@@ -186,11 +210,12 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 			// Key must start after value entry
 			if keyOffset < headerSize {
 				d.err = errors.Errorf("invalid key offset %d, must > %d", keyOffset, headerSize)
-				return nil
+				return
 			}
 
 			if d.isDataShort(data, keyOffset+keyLength) {
-				return nil
+				d.emitter.EmitNil()
+				return
 			}
 
 			keys[i] = hack.String(data[keyOffset : keyOffset+keyLength])
@@ -198,11 +223,29 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 	}
 
 	if d.err != nil {
-		return nil
+		return
 	}
 
-	values := make([]interface{}, count)
+	if isObject {
+		d.emitter.EmitMapBegin(count)
+	} else {
+		d.emitter.EmitArrayBegin(count)
+	}
+
 	for i := 0; i < count; i++ {
+		if i != 0 {
+			if isObject {
+				d.emitter.EmitMapNext()
+			} else {
+				d.emitter.EmitArrayNext()
+			}
+		}
+
+		if isObject {
+			d.emitter.EmitString(keys[i])
+			d.emitter.EmitMapValue()
+		}
+
 		// decode value
 		entryOffset := 2*offsetSize + valueEntrySize*i
 		if isObject {
@@ -212,33 +255,31 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 		tp := data[entryOffset]
 
 		if isInlineValue(tp, isSmall) {
-			values[i] = d.decodeValue(tp, data[entryOffset+1:entryOffset+valueEntrySize])
+			d.emitValue(tp, data[entryOffset+1:entryOffset+valueEntrySize])
 			continue
 		}
 
 		valueOffset := d.decodeCount(data[entryOffset+1:], isSmall)
 
 		if d.isDataShort(data, valueOffset) {
-			return nil
+			d.err = errors.Errorf("short array value")
+			return
 		}
 
-		values[i] = d.decodeValue(tp, data[valueOffset:])
+		d.emitValue(tp, data[valueOffset:])
 	}
 
 	if d.err != nil {
-		return nil
+		return
 	}
 
-	if !isObject {
-		return values
+	if isObject {
+		d.emitter.EmitMapEnd()
+	} else {
+		d.emitter.EmitArrayEnd()
 	}
 
-	m := make(map[string]interface{}, count)
-	for i := 0; i < count; i++ {
-		m[keys[i]] = values[i]
-	}
-
-	return m
+	return
 }
 
 func isInlineValue(tp byte, isSmall bool) bool {
@@ -252,25 +293,29 @@ func isInlineValue(tp byte, isSmall bool) bool {
 	return false
 }
 
-func (d *jsonBinaryDecoder) decodeLiteral(data []byte) interface{} {
+func (d *jsonBinaryDecoder) emitLiteral(data []byte) {
 	if d.isDataShort(data, 1) {
-		return nil
+		d.emitter.EmitNil()
+		return
 	}
 
 	tp := data[0]
 
 	switch tp {
 	case JSONB_NULL_LITERAL:
-		return nil
+		d.emitter.EmitNil()
+		return
 	case JSONB_TRUE_LITERAL:
-		return true
+		d.emitter.EmitBool(true)
+		return
 	case JSONB_FALSE_LITERAL:
-		return false
+		d.emitter.EmitBool(false)
+		return
 	}
 
 	d.err = errors.Errorf("invalid literal %c", tp)
 
-	return nil
+	return
 }
 
 func (d *jsonBinaryDecoder) isDataShort(data []byte, expected int) bool {
@@ -294,6 +339,11 @@ func (d *jsonBinaryDecoder) decodeInt16(data []byte) int16 {
 	return v
 }
 
+func (d *jsonBinaryDecoder) emitInt16(data []byte) {
+	v := d.decodeInt16(data)
+	d.emitter.EmitInt(int64(v), 16)
+}
+
 func (d *jsonBinaryDecoder) decodeUint16(data []byte) uint16 {
 	if d.isDataShort(data, 2) {
 		return 0
@@ -301,6 +351,11 @@ func (d *jsonBinaryDecoder) decodeUint16(data []byte) uint16 {
 
 	v := ParseBinaryUint16(data[0:2])
 	return v
+}
+
+func (d *jsonBinaryDecoder) emitUint16(data []byte) {
+	v := d.decodeUint16(data)
+	d.emitter.EmitUint(uint64(v), 16)
 }
 
 func (d *jsonBinaryDecoder) decodeInt32(data []byte) int32 {
@@ -312,6 +367,11 @@ func (d *jsonBinaryDecoder) decodeInt32(data []byte) int32 {
 	return v
 }
 
+func (d *jsonBinaryDecoder) emitInt32(data []byte) {
+	v := d.decodeInt32(data)
+	d.emitter.EmitInt(int64(v), 32)
+}
+
 func (d *jsonBinaryDecoder) decodeUint32(data []byte) uint32 {
 	if d.isDataShort(data, 4) {
 		return 0
@@ -319,6 +379,11 @@ func (d *jsonBinaryDecoder) decodeUint32(data []byte) uint32 {
 
 	v := ParseBinaryUint32(data[0:4])
 	return v
+}
+
+func (d *jsonBinaryDecoder) emitUint32(data []byte) {
+	v := d.decodeUint32(data)
+	d.emitter.EmitUint(uint64(v), 32)
 }
 
 func (d *jsonBinaryDecoder) decodeInt64(data []byte) int64 {
@@ -330,6 +395,11 @@ func (d *jsonBinaryDecoder) decodeInt64(data []byte) int64 {
 	return v
 }
 
+func (d *jsonBinaryDecoder) emitInt64(data []byte) {
+	v := d.decodeInt64(data)
+	d.emitter.EmitInt(v, 64)
+}
+
 func (d *jsonBinaryDecoder) decodeUint64(data []byte) uint64 {
 	if d.isDataShort(data, 8) {
 		return 0
@@ -339,6 +409,11 @@ func (d *jsonBinaryDecoder) decodeUint64(data []byte) uint64 {
 	return v
 }
 
+func (d *jsonBinaryDecoder) emitUint64(data []byte) {
+	v := d.decodeUint64(data)
+	d.emitter.EmitUint(v, 64)
+}
+
 func (d *jsonBinaryDecoder) decodeDouble(data []byte) float64 {
 	if d.isDataShort(data, 8) {
 		return 0
@@ -346,6 +421,11 @@ func (d *jsonBinaryDecoder) decodeDouble(data []byte) float64 {
 
 	v := ParseBinaryFloat64(data[0:8])
 	return v
+}
+
+func (d *jsonBinaryDecoder) emitDouble(data []byte) {
+	v := d.decodeDouble(data)
+	d.emitter.EmitFloat(v, 64)
 }
 
 func (d *jsonBinaryDecoder) decodeString(data []byte) string {
@@ -365,9 +445,15 @@ func (d *jsonBinaryDecoder) decodeString(data []byte) string {
 	return v
 }
 
-func (d *jsonBinaryDecoder) decodeOpaque(data []byte) interface{} {
+func (d *jsonBinaryDecoder) emitString(data []byte) {
+	v := d.decodeString(data)
+	d.emitter.EmitString(v)
+}
+
+func (d *jsonBinaryDecoder) emitOpaque(data []byte) {
 	if d.isDataShort(data, 1) {
-		return nil
+		d.emitter.EmitNil()
+		return
 	}
 
 	tp := data[0]
@@ -376,26 +462,25 @@ func (d *jsonBinaryDecoder) decodeOpaque(data []byte) interface{} {
 	l, n := d.decodeVariableLength(data)
 
 	if d.isDataShort(data, l+n) {
-		return nil
+		d.emitter.EmitNil()
+		return
 	}
 
 	data = data[n : l+n]
 
 	switch tp {
-	case MYSQL_TYPE_NEWDECIMAL:
-		return d.decodeDecimal(data)
-	case MYSQL_TYPE_TIME:
-		return d.decodeTime(data)
-	case MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_TIMESTAMP:
-		return d.decodeDateTime(data)
+	// case MYSQL_TYPE_NEWDECIMAL:
+	// 	d.emitDecimal(data)
+	// case MYSQL_TYPE_TIME:
+	// 	d.emitTime(data)
+	// case MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_TIMESTAMP:
+	// 	d.emitDateTime(data)
 	default:
-		return hack.String(data)
+		d.emitter.EmitString(hack.String(data))
 	}
-
-	return nil
 }
 
-func (d *jsonBinaryDecoder) decodeDecimal(data []byte) interface{} {
+func (d *jsonBinaryDecoder) emitDecimal(data []byte) interface{} {
 	precision := int(data[0])
 	scale := int(data[1])
 
@@ -405,7 +490,7 @@ func (d *jsonBinaryDecoder) decodeDecimal(data []byte) interface{} {
 	return v
 }
 
-func (d *jsonBinaryDecoder) decodeTime(data []byte) interface{} {
+func (d *jsonBinaryDecoder) emitTime(data []byte) interface{} {
 	v := d.decodeInt64(data)
 
 	if v == 0 {
@@ -427,7 +512,7 @@ func (d *jsonBinaryDecoder) decodeTime(data []byte) interface{} {
 	return fmt.Sprintf("%s%02d:%02d:%02d.%06d", sign, hour, min, sec, frac)
 }
 
-func (d *jsonBinaryDecoder) decodeDateTime(data []byte) interface{} {
+func (d *jsonBinaryDecoder) emitDateTime(data []byte) interface{} {
 	v := d.decodeInt64(data)
 	if v == 0 {
 		return "0000-00-00 00:00:00"
